@@ -477,6 +477,25 @@ def send_telegram_message_to(message: str, chat_id: str):
 def last_n_signals(df: pd.DataFrame, n: int = 5) -> pd.DataFrame:
     return df[df["signal"].notna()].tail(n)
 
+# Helper: print last 5 signals to console only (bullet lines, no headers)  <<< ADDED (console 5-signals)
+
+def print_last_five_signals_console_only(df: pd.DataFrame):
+    try:
+        if len(df) == 0:
+            return
+        current_price = float(df.iloc[-1]["close"])  # قیمت لحظه‌ای از کندل جاری
+        df_closed_hist = df.iloc[:-1].copy() if len(df) >= 2 else df.copy()
+        sigs = last_n_signals(df_closed_hist, 5)
+        if len(sigs) == 0:
+            return
+        # چاپ فقط خطوط بولت مانند نمونه کاربر
+        for _, row in sigs.iterrows():
+            print_signal_with_profit("•", row, current_price)
+    except Exception as _e:
+        # فقط لاگ نرم
+        print(f"⚠️ print_last_five_signals_console_only error: {_e}")
+
+
 # ==============================
 # 4) MAIN
 # ==============================
@@ -591,6 +610,9 @@ def main():
 
                 import threading
                 threading.Thread(target=send_delayed, daemon=True).start()
+
+                # بعد از ارسال، ۵ سیگنال آخر فقط در کنسول چاپ شود (فرمت بولت)
+                print_last_five_signals_console_only(df15)  # <<< ADDED (console 5-signals)
 
                 # به‌روزرسانی لاک با «زمان کندل بسته‌شدهٔ ارسال‌شده»  <<< CHANGED
                 last_printed_time = bar_time  # <<< CHANGED
