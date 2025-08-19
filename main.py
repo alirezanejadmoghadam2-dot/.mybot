@@ -1,11 +1,29 @@
 # -*- coding: utf-8 -*-
+import os
 import time
+import threading
 from datetime import datetime, timezone, timedelta
+
+from flask import Flask
 
 import ccxt
 import numpy as np
 import pandas as pd
 import requests
+
+# ==============================
+# 0) MINIMAL WEB SERVER (Render keeps the service alive)
+# ==============================
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "I'm alive!"
+
+def run_flask():
+    # Render provides the port via PORT env var
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
 
 # ==============================
 # 1) INPUT PARAMETERS (عین Pine)
@@ -363,13 +381,21 @@ def format_signal_message(row: pd.Series, current_price: float) -> str:
     return msg
 
 # ---------- ارسال تلگرام ----------
-TELEGRAM_TOKEN = "8196141905:AAESgGc3lSVsO5qMGpm58QyuN2djifz3GGQ"
+# *** امن‌سازی: مقادیر حساس را از متغیرهای محیطی بگیرید ***
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()           # کانال VIP
+TELEGRAM_CHAT_ID_PUBLIC = os.environ.get("TELEGRAM_CHAT_ID_PUBLIC", "").strip()  # کانال عمومی
 
-TELEGRAM_CHAT_ID = "-1003027394842"         # کانال VIP (اصلی - ارسال فوری)
-TELEGRAM_CHAT_ID_PUBLIC = "-1002419973211"  # کانال عمومی (ارسال با تاخیر برای سیگنال)
+def _can_send(chat_id: str) -> bool:
+    if not TELEGRAM_TOKEN or not chat_id:
+        print("⚠️ TELEGRAM_TOKEN یا chat_id تنظیم نشده است. پیام ارسال نشد.")
+        return False
+    return True
 
 def send_telegram_message(message: str):
-    """ارسال به کانال VIP (سازگاری با نسخه قبلی)"""
+    """ارسال به کانال VIP"""
+    if not _can_send(TELEGRAM_CHAT_ID):
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -385,6 +411,8 @@ def send_telegram_message(message: str):
 
 def send_telegram_message_to(message: str, chat_id: str):
     """ارسال به هر چت آی‌دی دلخواه (برای کانال عمومی/سایر کانال‌ها)"""
+    if not _can_send(chat_id):
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": chat_id,
@@ -423,7 +451,7 @@ def print_signal_with_profit(prefix: str, row: pd.Series, current_price: float):
         f"| profit={fmt_num(profit_pct,2)}%"
     )
 
-def main():
+def main_loop():
     # 1) داده‌ها
     df15 = fetch_ohlcv_df(symbol, tf, limit_15m)
 
@@ -508,7 +536,6 @@ def main():
                     time.sleep(delay_public_seconds)  # تاخیر بر حسب ثانیه (از ساعت محاسبه شده)
                     send_telegram_message_to(delayed_msg, TELEGRAM_CHAT_ID_PUBLIC)
 
-                import threading
                 threading.Thread(target=send_delayed, daemon=True).start()
 
                 # به‌روزرسانی لاک
@@ -520,4 +547,7 @@ def main():
         time.sleep(poll_seconds)
 
 if __name__ == "__main__":
-    main()
+    # Start the tiny web server in a separate thread (for Render)
+    threading.Thread(target=run_flask, daemon=True).start()
+    # Run your trading loop
+    main_loop()

@@ -1,3 +1,5 @@
-flask
-pandas
 ccxt
+pandas
+numpy
+requests
+Flask
