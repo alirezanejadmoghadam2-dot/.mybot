@@ -1,10 +1,6 @@
 # -*- coding: utf-8 -*-
-import os
 import time
-import threading
 from datetime import datetime, timezone, timedelta
-
-from flask import Flask, jsonify
 
 import ccxt
 import numpy as np
@@ -12,6 +8,82 @@ import pandas as pd
 import requests
 
 # ==============================
+# 0) MINIMAL WEB SERVER (Render keeps the service alive)
+# ==============================
+import os
+import threading
+try:
+    from flask import Flask, jsonify
+    _flask_available = True
+except Exception:
+    # اگر Flask نصب نبود، برنامه همچنان کار می‌کند؛ فقط بخش وب غیرفعال می‌شود
+    _flask_available = False
+
+PORT = int(os.environ.get("PORT", "10000"))
+# Render مقدار RENDER_EXTERNAL_URL را ست می‌کند. اگر نبود، می‌توانید SELF_URL را دستی ست کنید
+SELF_URL = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("SELF_URL")
+
+if _flask_available:
+    app = Flask(__name__)
+
+    @app.get("/")
+    def root():
+        return jsonify({
+            "ok": True,
+            "service": "signals",
+            "time": datetime.utcnow().isoformat() + "Z"
+        })
+
+    @app.get("/health")
+    def health():
+        return "ok", 200
+
+    def _run_web():
+        try:
+            # روی پورت ارائه‌شده توسط Render گوش می‌دهد
+            app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+        except Exception as e:
+            print(f"⚠️ Flask web server failed: {e}")
+else:
+    def _run_web():
+        # Flask موجود نیست → چیزی برای اجرا نیست
+        pass
+
+
+def _keep_alive_pinger():
+    """
+    پینگ دوره‌ای به آدرس سرویس (برای بیدار نگه داشتن Render Free Web Service)
+    اگر RENDER_EXTERNAL_URL یا SELF_URL ست نشده باشد، این بخش صرفاً پیام اطلاع می‌دهد و رد می‌شود.
+    """
+    if not SELF_URL:
+        print("ℹ️ RENDER_EXTERNAL_URL/SELF_URL not set; skipping self-ping.")
+        return
+    url = SELF_URL.rstrip("/") + "/health"
+    print(f"⏳ keep-alive ping thread → {url}")
+    while True:
+        try:
+            requests.get(url, timeout=10)
+        except Exception as e:
+            print(f"⚠️ keep-alive ping failed: {e}")
+        time.sleep(240)  # هر 4 دقیقه یکبار
+
+
+def start_keep_alive_webserver():
+    try:
+        threading.Thread(target=_run_web, daemon=True).start()
+        threading.Thread(target=_keep_alive_pinger, daemon=True).start()
+    except Exception as e:
+        print(f"⚠️ keep-alive bootstrap failed: {e}")
+
+
+
+
+
+
+
+
+
+
 # 1) INPUT PARAMETERS (عین Pine)
 # ==============================
 countbc = 3
@@ -62,8 +134,8 @@ signalLength_mtf = 9           # توجه: سیگنالِ MTF = SMA روی مک�
 # ==============================
 symbol = "BTC/USDT"       # KuCoin
 tf = "15m"                # تایم‌فریم اصلی
-limit_15m = 5000          # تعداد کندل‌ها
-poll_seconds = 300        # فاصله مانیتورینگ زنده (ثانیه) ← هر ۵ دقیقه
+limit_15m = 5000           # تعداد کندل‌ها
+poll_seconds = 300         # فاصله مانیتورینگ زنده (ثانیه) ← هر ۵ دقیقه
 LIVE = True               # برای مانیتورینگ زنده True/False
 
 # --- تاخیر ارسال به کانال عمومی بر حسب ساعت (قابل تنظیم)
@@ -367,10 +439,10 @@ def format_signal_message(row: pd.Series, current_price: float) -> str:
     return msg
 
 # ---------- ارسال تلگرام ----------
-# از ENV بخوان (اگر نبود، از مقادیر فعلی استفاده کن)
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8196141905:AAESgGc3lSVsO5qMGpm58QyuN2djifz3GGQ")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "-1003027394842")         # VIP
-TELEGRAM_CHAT_ID_PUBLIC = os.environ.get("TELEGRAM_CHAT_ID_PUBLIC", "-1002419973211")  # PUBLIC
+TELEGRAM_TOKEN = "8196141905:AAESgGc3lSVsO5qMGpm58QyuN2djifz3GGQ"
+
+TELEGRAM_CHAT_ID = "-1003027394842"         # کانال VIP (اصلی - ارسال فوری)
+TELEGRAM_CHAT_ID_PUBLIC = "-1002419973211"  # کانال عمومی (ارسال با تاخیر برای سیگنال)
 
 def send_telegram_message(message: str):
     """ارسال به کانال VIP (سازگاری با نسخه قبلی)"""
@@ -406,17 +478,8 @@ def last_n_signals(df: pd.DataFrame, n: int = 5) -> pd.DataFrame:
     return df[df["signal"].notna()].tail(n)
 
 # ==============================
-# 4) BACKGROUND LOOP + FLASK
+# 4) MAIN
 # ==============================
-
-# وضعیت سراسری برای وب‌سرور
-STATE = {
-    "worker_started": False,
-    "last_tick_utc": None,
-    "last_signal_utc": None,
-    "last_error": None
-}
-_state_lock = threading.Lock()
 
 def print_signal_with_profit(prefix: str, row: pd.Series, current_price: float):
     """چاپ سیگنال تاریخچه با سود فعلی (UTC+3:30) در کنسول"""
@@ -436,178 +499,108 @@ def print_signal_with_profit(prefix: str, row: pd.Series, current_price: float):
         f"| profit={fmt_num(profit_pct,2)}%"
     )
 
-def trading_worker():
-    """
-    حلقه‌ی پس‌زمینه: همان main قبلی با یک‌سری وضعیت برای وب‌سرور.
-    """
-    global STATE
-    try:
-        # 1) داده‌ها
-        df15 = fetch_ohlcv_df(symbol, tf, limit_15m)
+def main():
+    # 1) داده‌ها
+    df15 = fetch_ohlcv_df(symbol, tf, limit_15m)
 
-        # پیام تست شروع (همزمان به VIP و PUBLIC)
-        startup_msg = "⏰ برنامه شروع شد — وقت بخیر 🌞"
-        send_telegram_message(startup_msg)  # VIP
-        send_telegram_message_to(startup_msg, TELEGRAM_CHAT_ID_PUBLIC)  # PUBLIC
+    # پیام تست شروع (همزمان به VIP و PUBLIC)
+    startup_msg = "⏰ برنامه شروع شد — وقت بخیر 🌞"
+    send_telegram_message(startup_msg)  # VIP
+    send_telegram_message_to(startup_msg, TELEGRAM_CHAT_ID_PUBLIC)  # PUBLIC
 
-        # 2) اندیکاتورها + شرایط
-        df15 = compute_indicators(df15)
-        df15 = build_conditions(df15)
+    # 2) اندیکاتورها + شرایط
+    df15 = compute_indicators(df15)
+    df15 = build_conditions(df15)
 
-        # 3) چاپ ۵ سیگنال آخر تاریخچه (با قیمت و سود تا این لحظه) — فقط کندل‌های بسته‌شده
-        df15_closed_hist = df15.iloc[:-1].copy() if len(df15) >= 2 else df15.copy()
-        sigs = last_n_signals(df15_closed_hist, 5)
-        if len(sigs) == 0:
-            print("ℹ️ هیچ سیگنال تاریخی یافت نشد.")
-        else:
-            current_price = float(df15.iloc[-1]["close"])  # قیمت لحظه‌ای از کندل جاری
-            print("🕔 ۵ سیگنال آخر تاریخچه (UTC+3:30) با سود فعلی (مبنای ورود = کندل‌های بسته‌شده):")
-            for _, row in sigs.iterrows():
-                print_signal_with_profit("•", row, current_price)
+    # 3) چاپ ۵ سیگنال آخر تاریخچه (با قیمت و سود تا این لحظه)
+    # --- فقط کندل‌های بسته‌شده را در تاریخچه در نظر بگیر (آخرین سطر معمولاً کندل جاری است)  <<< CHANGED
+    df15_closed_hist = df15.iloc[:-1].copy() if len(df15) >= 2 else df15.copy()  # <<< CHANGED
+    sigs = last_n_signals(df15_closed_hist, 5)  # <<< CHANGED
+    if len(sigs) == 0:
+        print("ℹ️ هیچ سیگنال تاریخی یافت نشد.")
+    else:
+        current_price = float(df15.iloc[-1]["close"])  # قیمت لحظه‌ای از کندل جاری
+        print("🕔 ۵ سیگنال آخر تاریخچه (UTC+3:30) با سود فعلی (مبنای ورود = کندل‌های بسته‌شده):")  # <<< CHANGED
+        for _, row in sigs.iterrows():
+            print_signal_with_profit("•", row, current_price)
 
-        # 4) اگر آخرین کندلِ بسته‌شده سیگنال دارد، پیش‌نمایش
-        last_closed_row = df15.iloc[-2] if len(df15) >= 2 else df15.iloc[-1]
-        if pd.notna(last_closed_row["signal"]):
-            current_price = float(df15.iloc[-1]["close"])
-            preview_msg = format_signal_message(last_closed_row, current_price)
-            print("ℹ️ سیگنال آخرین کندلِ بسته‌شده:\n" + preview_msg)
+    # 4) اگر آخرین کندلِ بسته‌شده سیگنال دارد، در کنسول اطلاع بده (پیش‌نمایش)  <<< CHANGED
+    last_closed_row = df15.iloc[-2] if len(df15) >= 2 else df15.iloc[-1]  # <<< CHANGED
+    if pd.notna(last_closed_row["signal"]):  # <<< CHANGED
+        current_price = float(df15.iloc[-1]["close"])  # قیمت لحظه‌ای
+        preview_msg = format_signal_message(last_closed_row, current_price)  # <<< CHANGED
+        print("ℹ️ سیگنال آخرین کندلِ بسته‌شده:\n" + preview_msg)  # <<< CHANGED
 
-        # 5) مانیتورینگ زنده: فقط وقتی «سیگنال جدید روی کندل بسته‌شده» صادر شد ارسال/چاپ کن
-        last_printed_time = int(last_closed_row["time"]) if len(df15) else 0
+    # 5) مانیتورینگ زنده: فقط وقتی «سیگنال جدید روی کندل بسته‌شده» صادر شد ارسال/چاپ کن  <<< CHANGED
+    last_printed_time = int(last_closed_row["time"]) if len(df15) else 0  # <<< CHANGED
 
-        while True:
-            try:
-                # heartbeat برای وب‌سرور
-                with _state_lock:
-                    STATE["last_tick_utc"] = datetime.utcnow().isoformat()
+    if not LIVE:
+        return
 
-                # فقط کندل آخر را از API بگیر و به df اضافه/به‌روز کن
-                last_df = fetch_last_candle_df(symbol, tf)
-                df15 = upsert_last_candle(df15, last_df)
+    while True:
+        try:
+            # فقط کندل آخر را از API بگیر و به df اضافه/به‌روز کن
+            last_df = fetch_last_candle_df(symbol, tf)
+            df15 = upsert_last_candle(df15, last_df)
 
-                # برای ارزیابی سیگنال روی کندلِ بسته‌شده، حداقل به 3 سطر نیاز داریم
-                if len(df15) < 3:
-                    time.sleep(poll_seconds)
-                    continue
+            # برای ارزیابی سیگنال روی کندلِ بسته‌شده، حداقل به 3 سطر نیاز داریم: [..., prev_closed, last_closed, current_open]  <<< CHANGED
+            if len(df15) < 3:
+                time.sleep(poll_seconds)
+                continue
 
-                # اندیکاتورها و شرایط را مجدداً محاسبه کن
-                df15 = compute_indicators(df15)
-                df15 = build_conditions(df15)
+            # اندیکاتورها و شرایط را مجدداً محاسبه کن
+            df15 = compute_indicators(df15)
+            df15 = build_conditions(df15)
 
-                # «کندل بسته‌شدهٔ اخیر» و «کندل بسته‌شدهٔ قبلی»
-                lr = df15.iloc[-2]   # last closed bar
-                pr = df15.iloc[-3]   # previous closed bar
-                sig = lr["signal"]
-                prev_sig = pr["signal"] if "signal" in pr else None
-                bar_time = int(lr["time"])  # زمان کندل بسته‌شدهٔ اخیر
+            # «کندل بسته‌شدهٔ اخیر» و «کندل بسته‌شدهٔ قبلی»  <<< CHANGED
+            lr = df15.iloc[-2]   # last closed bar  <<< CHANGED
+            pr = df15.iloc[-3]   # previous closed bar  <<< CHANGED
+            sig = lr["signal"]
+            prev_sig = pr["signal"] if "signal" in pr else None
+            bar_time = int(lr["time"])  # زمان کندل بسته‌شدهٔ اخیر  <<< CHANGED
 
-                # فقط وقتی کندل بسته‌شدهٔ جدید داریم، و سیگنال نسبت به قبلی تغییر کرده باشد
-                is_new_closed_bar = (bar_time != last_printed_time)
-                is_new_signal_event = is_new_closed_bar and pd.notna(sig) and ((not pd.notna(prev_sig)) or (sig != prev_sig))
+            # فقط وقتی کندل بسته‌شدهٔ جدید داریم، و سیگنال نسبت به کندل بسته‌شدهٔ قبلی تغییر کرده باشد  <<< CHANGED
+            is_new_closed_bar = (bar_time != last_printed_time)  # <<< CHANGED
+            is_new_signal_event = is_new_closed_bar and pd.notna(sig) and ( (not pd.notna(prev_sig)) or (sig != prev_sig) )  # <<< CHANGED
 
-                if is_new_signal_event:
-                    current_price = float(df15.iloc[-1]["close"])  # قیمت لحظه‌ای از کندل جاری
-                    message_text = format_signal_message(lr, current_price)  # مبنا = کندل بسته‌شده
+            if is_new_signal_event:
+                current_price = float(df15.iloc[-1]["close"])  # قیمت لحظه‌ای از کندل جاری
+                message_text = format_signal_message(lr, current_price)  # مبنا = کندل بسته‌شده  <<< CHANGED
 
-                    # چاپ در کنسول
-                    print("📢 سیگنال جدید (کندل بسته‌شده):\n" + message_text)
+                # چاپ در کنسول
+                print("📢 سیگنال جدید (کندل بسته‌شده):\n" + message_text)  # <<< CHANGED
 
-                    # ارسال فوری به کانال VIP (اصلی)
-                    send_telegram_message(message_text)
+                # ارسال فوری به کانال VIP (اصلی)
+                send_telegram_message(message_text)
 
-                    # آماده‌سازی پیام کانال عمومی با متن انتهایی
-                    delayed_msg = (
-                        message_text +
-                        "\n\n"
-                        "این سیگنال در کانال عمومی با تاخیر ارسال شده\n"
-                        "جهت دریافت در لحظه ی سیگنال به کانال VIP بپیوندید\n"
-                        "موقتا عضویت در کانال VIP رایگان است\n\n"
-                        "ارتباط با پشتیبانی:\n"
-                        "@btctrader321\n"
-                    )
+                # آماده‌سازی پیام کانال عمومی با متن انتهایی
+                delayed_msg = (
+                    message_text +
+                    "\n\n"
+                    "این سیگنال در کانال عمومی با تاخیر ارسال شده\n"
+                    "جهت دریافت در لحظه ی سیگنال به کانال VIP بپیوندید\n"
+                    "موقتا عضویت در کانال VIP رایگان است\n\n"
+                    "ارتباط با پشتیبانی:\n"
+                    "@btctrader321\n"
+                )
 
-                    # ارسال به کانال عمومی فقط برای سیگنال جدید، با تاخیر تنظیم‌شده
-                    def send_delayed():
-                        time.sleep(delay_public_seconds)
-                        send_telegram_message_to(delayed_msg, TELEGRAM_CHAT_ID_PUBLIC)
+                # ارسال به کانال عمومی فقط برای سیگنال جدید، با تاخیر تنظیم‌شده
+                def send_delayed():
+                    time.sleep(delay_public_seconds)  # تاخیر بر حسب ثانیه (از ساعت محاسبه شده)
+                    send_telegram_message_to(delayed_msg, TELEGRAM_CHAT_ID_PUBLIC)
 
-                    threading.Thread(target=send_delayed, daemon=True).start()
+                import threading
+                threading.Thread(target=send_delayed, daemon=True).start()
 
-                    # به‌روزرسانی وضعیت
-                    with _state_lock:
-                        STATE["last_signal_utc"] = datetime.utcnow().isoformat()
+                # به‌روزرسانی لاک با «زمان کندل بسته‌شدهٔ ارسال‌شده»  <<< CHANGED
+                last_printed_time = bar_time  # <<< CHANGED
 
-                    # لاک زمان کندل ارسال‌شده
-                    last_printed_time = bar_time
+        except Exception as e:
+            print(f"❌ خطا: {e}")
 
-            except Exception as e:
-                with _state_lock:
-                    STATE["last_error"] = str(e)
-                print(f"❌ خطا در حلقه: {e}")
-
-            time.sleep(poll_seconds)
-
-    except Exception as e_outer:
-        with _state_lock:
-            STATE["last_error"] = f"FATAL: {e_outer}"
-        print(f"❌ خطای بحرانی: {e_outer}")
-
-# --- کنترل اجرای یکتا برای حلقه
-_worker_thread = None
-_worker_guard = threading.Lock()
-
-def ensure_worker_started():
-    global _worker_thread
-    with _worker_guard:
-        if not STATE["worker_started"]:
-            _worker_thread = threading.Thread(target=trading_worker, daemon=True)
-            _worker_thread.start()
-            STATE["worker_started"] = True
-            print("✅ مانیتورینگ پس‌زمینه استارت شد.")
-
-# ---------- Flask App ----------
-app = Flask(__name__)
-
-@app.route("/")
-def index():
-    with _state_lock:
-        st = STATE.copy()
-    return (
-        "<h3>BTC/USDT Signal Bot — Render</h3>"
-        f"<p>Worker started: <b>{st['worker_started']}</b></p>"
-        f"<p>Last tick (UTC): <code>{st['last_tick_utc']}</code></p>"
-        f"<p>Last signal (UTC): <code>{st['last_signal_utc']}</code></p>"
-        f"<p>Last error: <code>{st['last_error']}</code></p>"
-        "<p>Routes: <code>/healthz</code>, <code>/start</code>, <code>/status</code></p>"
-    )
-
-@app.route("/healthz")
-def healthz():
-    # برای health check رندر/آپتایم ربات
-    return jsonify(ok=True), 200
-
-@app.route("/start")
-def start():
-    ensure_worker_started()
-    return jsonify(started=True, already_running=STATE["worker_started"]), 200
-
-@app.route("/status")
-def status():
-    with _state_lock:
-        st = STATE.copy()
-    return jsonify(st), 200
-
-# وقتی نخستین درخواست آمد، استارت بزن (اگر نخواستی، می‌توانی این را کامنت کنی)
-@app.before_request
-def _auto_start():
-    ensure_worker_started()
-
-def run_server():
-    # Render پورت را در PORT می‌گذارد
-    port = int(os.environ.get("PORT", "10000"))
-    # در محیط تولید بهتره با gunicorn اجرا شود، ولی این هم کار می‌کند
-    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+        time.sleep(poll_seconds)
 
 if __name__ == "__main__":
-    # اجرای وب‌سرور (و خودکار حلقه پس‌زمینه)
-    run_server()
+    # راه‌اندازی وب‌سرور و پینگِ نگهدارنده (بدون تغییر در منطق ارسال تلگرام)
+    start_keep_alive_webserver()
+    main()
