@@ -421,5 +421,10 @@ def main():
 
         time.sleep(poll_seconds)
 
+import os
+
 if __name__ == "__main__":
-    main()
+    # پورت را از متغیر محیطی Render بگیر، اگر نبود به طور پیش‌فرض از 10000 استفاده کن
+    port = int(os.environ.get('PORT', 10000))
+    # برنامه را روی هاست 0.0.0.0 اجرا کن تا از خارج از کانتینر در دسترس باشد
+    app.run(host='0.0.0.0', port=port)
