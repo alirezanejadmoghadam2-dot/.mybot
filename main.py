@@ -7,6 +7,8 @@ import numpy as np
 import pandas as pd
 import requests
 import threading
+from flask import Flask
+import os
 
 # ==============================
 # 1) INPUT PARAMETERS (عین Pine)
@@ -421,7 +423,27 @@ def main():
 
         time.sleep(poll_seconds)
 
-import os
 
+
+# --- یک وب سرور ساده Flask بسازید ---
+app = Flask(__name__)
+
+# این یک "روت" است که وقتی سایت پینگر به آدرس شما سر می‌زند، پاسخ می‌دهد
+@app.route('/')
+def health_check():
+    return "Bot is alive!", 200
+
+# --- تابع ربات شما باید در یک ترد جدا اجرا شود ---
+def run_bot():
+    print("Starting the bot logic in a separate thread...")
+    main() # تابع اصلی شما که حاوی حلقه while True است
+
+# --- بخش اصلی اجرای برنامه ---
 if __name__ == "__main__":
-    main()
+    # ۱. ترد ربات را راه‌اندازی کنید
+    bot_thread = threading.Thread(target=run_bot)
+    bot_thread.start()
+    
+    # ۲. وب سرور را برای زنده نگه داشتن سرویس اجرا کنید
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
