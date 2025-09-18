@@ -310,7 +310,7 @@ def build_dca_lines(kind: str, entry_price: float):
     lines = []
     for k in range(10):
         price_s = dca_price_str(kind, entry_price, k)
-        lines.append(f"10 درصد از موجودی از موجودی را در  price={price_s}  وارد شوید")
+        lines.append(f"10 درصد از موجودی را در  price={price_s}  وارد شوید")
     return lines
 
 def format_signal_message_vip(row: pd.Series, current_price: float) -> str:
