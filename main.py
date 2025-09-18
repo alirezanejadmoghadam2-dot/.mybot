@@ -298,11 +298,13 @@ def format_signal_message(row: pd.Series, current_price: float) -> str:
 # تعیین فرمت اعشار DCA
 def dca_price_str(kind: str, entry_price: float, k: int) -> str:
     # k = 0..9
+    step = 0.005  # 0.5 درصد
+
     if kind == "SELL":
-        level_price = entry_price * (1 + 0.01 * k)
+        level_price = entry_price * (1 + step * k)
         digits = 2 if k == 7 else 0
-    else:
-        level_price = entry_price * (1 - 0.01 * k)
+    else:  # BUY
+        level_price = entry_price * (1 - step * k)
         digits = 2 if k in (3, 7) else 0
     return fmt_num(level_price, digits)
 
